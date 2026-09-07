@@ -1,0 +1,71 @@
+`EventManager.RegisterClassHandler` is a WPF mechanism that lets you attach a handler to a routed event for an entire **class** of controls, rather than to one specific instance. You call it once, statically, and it applies to every current and future instance of that type (and its subclasses) in the app.
+
+## How it differs from a normal handler
+
+Normally you do this per-instance:
+
+```xml
+<Button Click="SaveButton_Click" />
+```
+
+That only fires for that one `Button`. `RegisterClassHandler` instead says "for every object of type `ButtonBase` anywhere in the visual tree, run this handler when `Click` is raised":
+
+```csharp
+EventManager.RegisterClassHandler(
+    typeof(ButtonBase),                 // the class (and subclasses: Button, RepeatButton, ToggleButton...)
+    ButtonBase.ClickEvent,               // the routed event
+    new RoutedEventHandler(OnAnyClick),  // your handler
+    handledEventsToo: true);             // see below
+```
+
+You typically call this once — in a static constructor, in `App.OnStartup`, or in a static class you initialize at boot. It's not tied to any single window or control instance's lifetime.
+
+## Key mechanics
+
+**1. It's registered per-type, inherited by subclasses.**
+Registering on `ButtonBase` catches `Button`, `RepeatButton`, `ToggleButton`, and any custom control that derives from `ButtonBase` — including third-party ones. This is why it gives you "free" coverage: you don't need to touch each XAML file.
+
+**2. Class handlers run *before* instance handlers.**
+Routed events fire class handlers (registered via `RegisterClassHandler`) first, in order from base type to derived type, and only afterward do instance handlers (the `Click="..."` in XAML, or `button.Click += ...`) run. So your telemetry hook sees the click before the ViewModel's own handler does.
+
+**3. `handledEventsToo: true` matters a lot for telemetry.**
+By default, WPF routed events stop invoking handlers further along if something already set `e.Handled = true`. If a button's own click handler (or a parent's) marks the event handled, your class handler — if registered without `handledEventsToo`, or if it runs after that point — could miss it. Passing `true` ensures you get the notification regardless of whether the event was later marked handled by someone else in the chain. Without it you will silently undercount.
+
+**4. It doesn't stop propagation or interfere with normal handling.**
+Your telemetry handler is additive — it doesn't need to (and shouldn't) set `e.Handled`. The ViewModel's actual click/command logic still runs normally afterward.
+
+**5. Static, app-lifetime registration — no cleanup needed, but also no way to unregister per-instance.**
+There's no `Unregister` API. It's meant to be a permanent, app-wide hook, not something you toggle on/off for individual windows. If you need conditional tracking, filter inside the handler itself (e.g., check `sender`'s type or a tag) rather than trying to register/unregister dynamically.
+
+**6. `sender` is the actual instance, so you still get full details.**
+Even though registration is class-wide, the handler receives the specific `ButtonBase` instance that was clicked as `sender`, and `e.OriginalSource` if you need the exact element that was interacted with (useful if a `Button`'s `Content` is a `StackPanel` with an icon + text, and the click originated on the icon).
+
+## Practical gotcha: where to call it
+
+It has to run before any window is shown, otherwise you might miss early clicks (unlikely to matter for a splash screen, but worth being deliberate). The safe pattern:
+
+```csharp
+public partial class App : Application
+{
+    protected override void OnStartup(StartupEventArgs e)
+    {
+        base.OnStartup(e);
+        UiTelemetryHooks.Register(); // before MainWindow is constructed/shown
+        // ... rest of startup
+    }
+}
+```
+
+Because it's a static, type-level registration, calling `Register()` more than once will attach the handler multiple times and you'll get duplicate telemetry events — guard it with a flag if there's any chance of double-init (e.g., in tests, or hot-reload scenarios):
+
+```csharp
+private static bool _registered;
+public static void Register()
+{
+    if (_registered) return;
+    _registered = true;
+    EventManager.RegisterClassHandler(/* ... */);
+}
+```
+
+That's really the whole mechanism — it's a relatively obscure but very deliberate WPF feature (used internally by WPF itself, e.g. `TextBoxBase` uses it to implement default behaviors), and it's a good fit for exactly this kind of cross-cutting "observe everything of type X" telemetry use case.
